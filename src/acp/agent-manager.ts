@@ -7,6 +7,8 @@ import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import packageJson from "../../package.json" with { type: "json" };
 import type { WeChatAcpClient } from "./client.js";
+import { WECHAT_ACP_SUPPRESS_CODEX_STOP_HOOK } from "./env.js";
+import { formatUnknownError } from "./errors.js";
 import { trackException } from "../telemetry/index.js";
 
 export interface AgentProcessInfo {
@@ -33,13 +35,13 @@ export async function spawnAgent(params: {
   const proc = spawn(command, args, {
     stdio: ["pipe", "pipe", "inherit"],
     cwd,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...env, [WECHAT_ACP_SUPPRESS_CODEX_STOP_HOOK]: "1" },
     shell: useShell,
     windowsHide: true,
   });
 
   proc.on("error", (err) => {
-    log(`Agent process error: ${String(err)}`);
+    log(`Agent process error: ${formatUnknownError(err)}`);
     trackException(err, "agent_spawn");
   });
 

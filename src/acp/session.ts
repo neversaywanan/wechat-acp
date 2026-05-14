@@ -6,9 +6,11 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { WeChatAcpClient } from "./client.js";
 import { spawnAgent, killAgent, type AgentProcessInfo } from "./agent-manager.js";
+import { formatUnknownError } from "./errors.js";
 import { trackEvent, trackException, hashUserId } from "../telemetry/index.js";
 
 export interface PendingMessage {
@@ -93,7 +95,7 @@ export class SessionManager {
       // Fire-and-forget processing loop for this user
       session.processing = true;
       this.processQueue(session).catch((err) => {
-        this.opts.log(`[${userId}] queue processing error: ${String(err)}`);
+        this.opts.log(`[${userId}] queue processing error: ${formatUnknownError(err)}`);
       });
     }
   }
@@ -114,6 +116,8 @@ export class SessionManager {
       onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
       showThoughts: this.opts.showThoughts,
+      agentCwd: this.opts.agentCwd,
+      mediaOutputDir: path.join(this.opts.agentCwd, "outbound-media", "codex-generated-images"),
     });
 
     const agentInfo = await spawnAgent({
@@ -124,6 +128,7 @@ export class SessionManager {
       client,
       log: (msg) => this.opts.log(`[${userId}] ${msg}`),
     });
+    client.setSessionId(agentInfo.sessionId);
 
     trackEvent("session.created", {
       userIdHash: hashUserId(userId),
@@ -203,7 +208,8 @@ export class SessionManager {
             await this.opts.onReply(session.userId, pending.contextToken, replyText);
           }
         } catch (err) {
-          this.opts.log(`[${session.userId}] Agent prompt error: ${String(err)}`);
+          const errorMessage = formatUnknownError(err);
+          this.opts.log(`[${session.userId}] Agent prompt error: ${errorMessage}`);
 
           trackException(err, "prompt");
           trackEvent("prompt.completed", {
@@ -227,7 +233,7 @@ export class SessionManager {
             await this.opts.onReply(
               session.userId,
               pending.contextToken,
-              `⚠️ Agent error: ${String(err)}`,
+              `⚠️ Agent error: ${errorMessage}`,
             );
           } catch {
             // best effort

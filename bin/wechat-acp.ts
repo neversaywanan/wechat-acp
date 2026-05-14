@@ -17,6 +17,10 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import qrcodeTerminal from "qrcode-terminal";
 import { WeChatAcpBridge } from "../src/bridge.js";
+import { formatUnknownError } from "../src/acp/errors.js";
+import { handleCodexHooksCommand, runCodexHook } from "../src/codex/hooks.js";
+import { getUpdates } from "../src/weixin/api.js";
+import { loadToken, login as loginWeChat } from "../src/weixin/auth.js";
 import {
   defaultConfig,
   listBuiltInAgents,
@@ -42,6 +46,10 @@ wechat-acp — Bridge WeChat to any ACP-compatible AI agent
 Usage:
   wechat-acp --agent <preset|command>  [options]
   wechat-acp agents                        List built-in agent presets
+  wechat-acp login                         Log in with WeChat QR code, then exit
+  wechat-acp auth-status                   Check whether the saved WeChat login is valid
+  wechat-acp codex-hooks <command>          Manage Codex App hooks for WeChat
+  wechat-acp codex-hook                     Internal command called by Codex hooks
   wechat-acp stop                          Stop a running daemon
   wechat-acp status                        Check daemon status
 
@@ -144,6 +152,37 @@ function loadConfigFile(filePath: string): Partial<WeChatAcpConfig> {
   return JSON.parse(content) as Partial<WeChatAcpConfig>;
 }
 
+function applyConfigFile(config: WeChatAcpConfig, filePath?: string): void {
+  if (!filePath) return;
+  const fileConfig = loadConfigFile(filePath);
+  Object.assign(config.wechat, fileConfig.wechat ?? {});
+  Object.assign(config.agent, fileConfig.agent ?? {});
+  Object.assign(config.agents, fileConfig.agents ?? {});
+  Object.assign(config.session, fileConfig.session ?? {});
+  Object.assign(config.daemon, fileConfig.daemon ?? {});
+  Object.assign(config.storage, fileConfig.storage ?? {});
+}
+
+function extractConfigArg(argv: string[]): { configFile?: string; rest: string[] } {
+  const rest: string[] = [];
+  let configFile: string | undefined;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--config") {
+      configFile = argv[++i];
+      continue;
+    }
+    if (arg.startsWith("--config=")) {
+      configFile = arg.slice("--config=".length);
+      continue;
+    }
+    rest.push(arg);
+  }
+
+  return { configFile, rest };
+}
+
 function handleAgents(config: WeChatAcpConfig): void {
   console.log("Built-in ACP agent presets:\n");
   for (const { id, preset } of listBuiltInAgents(config.agents)) {
@@ -194,6 +233,64 @@ function handleStatus(config: WeChatAcpConfig): void {
   }
 }
 
+function getSyncBufPath(storageDir: string): string {
+  return path.join(storageDir, "sync-buf.json");
+}
+
+function loadSyncBuf(storageDir: string): string {
+  const p = getSyncBufPath(storageDir);
+  if (!fs.existsSync(p)) return "";
+  try {
+    const data = JSON.parse(fs.readFileSync(p, "utf-8")) as { get_updates_buf?: string };
+    return data.get_updates_buf ?? "";
+  } catch {
+    return "";
+  }
+}
+
+async function handleLogin(config: WeChatAcpConfig): Promise<void> {
+  await loginWeChat({
+    baseUrl: config.wechat.baseUrl,
+    botType: config.wechat.botType,
+    storageDir: config.storage.dir,
+    log: (msg) => console.log(msg),
+    renderQrUrl: renderQrInTerminal,
+  });
+}
+
+async function handleAuthStatus(config: WeChatAcpConfig): Promise<void> {
+  const tokenData = loadToken(config.storage.dir);
+  if (!tokenData) {
+    console.log("Auth expired (no saved token)");
+    process.exitCode = 10;
+    return;
+  }
+
+  try {
+    const resp = await getUpdates({
+      baseUrl: tokenData.baseUrl,
+      token: tokenData.token,
+      get_updates_buf: loadSyncBuf(config.storage.dir),
+      timeoutMs: 5_000,
+    });
+    const code = resp.errcode ?? resp.ret ?? 0;
+    if (code === -14) {
+      console.log("Auth expired (errcode -14)");
+      process.exitCode = 10;
+      return;
+    }
+    if (code !== 0) {
+      console.error(`Auth check failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`);
+      process.exitCode = 11;
+      return;
+    }
+    console.log(`Auth valid (Bot: ${tokenData.accountId}, saved at ${tokenData.savedAt})`);
+  } catch (err) {
+    console.error(`Auth check failed: ${String(err)}`);
+    process.exitCode = 11;
+  }
+}
+
 function daemonize(config: WeChatAcpConfig): void {
   const logFile = config.daemon.logFile;
   const pidFile = config.daemon.pidFile;
@@ -228,6 +325,25 @@ function renderQrInTerminal(url: string): void {
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "codex-hook") {
+    const { configFile, rest } = extractConfigArg(process.argv.slice(3));
+    const config = defaultConfig();
+    applyConfigFile(config, configFile);
+    await runCodexHook(config, { binPath: process.argv[1], out: process.stdout, err: process.stderr, renderQrUrl: renderQrInTerminal });
+    if (rest.length > 0) {
+      // Extra arguments are ignored for hook mode; Codex passes payload on stdin.
+    }
+    return;
+  }
+
+  if (process.argv[2] === "codex-hooks") {
+    const { configFile, rest } = extractConfigArg(process.argv.slice(3));
+    const config = defaultConfig();
+    applyConfigFile(config, configFile);
+    await handleCodexHooksCommand(rest, config, { binPath: process.argv[1], out: process.stdout, err: process.stderr, renderQrUrl: renderQrInTerminal });
+    return;
+  }
+
   const args = parseArgs(process.argv);
 
   if (args.help) {
@@ -238,19 +354,19 @@ async function main(): Promise<void> {
   const config = defaultConfig();
 
   // Load config file if specified
-  if (args.configFile) {
-    const fileConfig = loadConfigFile(args.configFile);
-    Object.assign(config.wechat, fileConfig.wechat ?? {});
-    Object.assign(config.agent, fileConfig.agent ?? {});
-    Object.assign(config.agents, fileConfig.agents ?? {});
-    Object.assign(config.session, fileConfig.session ?? {});
-    Object.assign(config.daemon, fileConfig.daemon ?? {});
-    Object.assign(config.storage, fileConfig.storage ?? {});
-  }
+  applyConfigFile(config, args.configFile);
 
   // Handle subcommands
   if (args.command === "agents") {
     handleAgents(config);
+    return;
+  }
+  if (args.command === "login") {
+    await handleLogin(config);
+    return;
+  }
+  if (args.command === "auth-status") {
+    await handleAuthStatus(config);
     return;
   }
   if (args.command === "stop") {
@@ -341,13 +457,13 @@ async function main(): Promise<void> {
       trackException(err, "main");
       trackEvent("app.stop", { reason: "error", uptimeSec: Math.round((Date.now() - startedAt) / 1000) });
       await shutdownTelemetry();
-      console.error(`Fatal: ${String(err)}`);
+      console.error(`Fatal: ${formatUnknownError(err)}`);
       process.exit(1);
     }
   }
 }
 
 main().catch((err) => {
-  console.error(`Fatal: ${String(err)}`);
+  console.error(`Fatal: ${formatUnknownError(err)}`);
   process.exit(1);
 });

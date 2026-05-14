@@ -3,6 +3,9 @@
 ## 0.1.4
 
 - Update `claude` preset to use `@agentclientprotocol/claude-agent-acp` (the deprecated `@zed-industries/claude-code-acp` was renamed)
+- Add Codex App hook management for WeChat Stop notifications and PermissionRequest approval
+- Add outbound local image/video upload to WeChat CDN before sending media messages
+- Use the current Codex `[features].hooks` flag instead of deprecated `[features].codex_hooks`
 
 ## 0.1.3
 

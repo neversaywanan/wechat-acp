@@ -52,6 +52,7 @@ async function apiPost<T>(
   body: Record<string, unknown>,
   token?: string,
   timeoutMs = 15_000,
+  returnEmptyOnAbort = false,
 ): Promise<T> {
   const url = `${baseUrl.replace(/\/$/, "")}/${endpoint}`;
   const payload = { ...body, base_info: buildBaseInfo() };
@@ -73,7 +74,7 @@ async function apiPost<T>(
     return JSON.parse(text) as T;
   } catch (err) {
     clearTimeout(timer);
-    if ((err as Error).name === "AbortError") {
+    if ((err as Error).name === "AbortError" && returnEmptyOnAbort) {
       return { ret: 0, msgs: [] } as T;
     }
     throw err;
@@ -92,6 +93,7 @@ export async function getUpdates(params: {
     { get_updates_buf: params.get_updates_buf },
     params.token,
     params.timeoutMs ?? 38_000,
+    true,
   );
 }
 

@@ -5,19 +5,24 @@
  * One bridge = one WeChat bot account → many users → many agent sessions.
  */
 
+import path from "node:path";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
-import { sendTextMessage, splitText } from "./weixin/send.js";
+import { sendMediaMessage, sendTextMessage, splitText } from "./weixin/send.js";
+import { defaultOutboundMediaRoots, resolveOutboundMedia } from "./weixin/outbound-media.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
 import { SessionManager } from "./acp/session.js";
+import { formatUnknownError } from "./acp/errors.js";
 import { weixinMessageToPrompt } from "./adapter/inbound.js";
-import { formatForWeChat } from "./adapter/outbound.js";
+import { formatForWeChat, splitOutboundReply } from "./adapter/outbound.js";
 import type { WeChatAcpConfig } from "./config.js";
 import { trackEvent, trackException, hashUserId } from "./telemetry/index.js";
 
 const TEXT_CHUNK_LIMIT = 4000;
+const INBOUND_DEDUPE_TTL_MS = 10 * 60_000;
+const INBOUND_DEDUPE_MAX_KEYS = 2000;
 
 export class WeChatAcpBridge {
   private config: WeChatAcpConfig;
@@ -26,6 +31,7 @@ export class WeChatAcpBridge {
   private tokenData: TokenData | null = null;
   // Per-user typing ticket cache
   private typingTickets = new Map<string, { ticket: string; expiresAt: number }>();
+  private seenInboundMessages = new Map<string, number>();
   private log: (msg: string) => void;
 
   constructor(config: WeChatAcpConfig, log?: (msg: string) => void) {
@@ -121,6 +127,12 @@ export class WeChatAcpBridge {
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
 
+    const dedupeKey = this.inboundMessageKey(msg, userId);
+    if (dedupeKey && !this.markInboundMessageSeen(dedupeKey)) {
+      this.log(`Skipped duplicate message from ${userId}: ${this.previewMessage(msg)}`);
+      return;
+    }
+
     this.log(`Message from ${userId}: ${this.previewMessage(msg)}`);
 
     trackEvent("message.received", {
@@ -130,7 +142,7 @@ export class WeChatAcpBridge {
 
     // Convert and enqueue — fire-and-forget (don't block the poll loop)
     this.enqueueMessage(msg, userId, contextToken).catch((err) => {
-      this.log(`Failed to enqueue message from ${userId}: ${String(err)}`);
+      this.log(`Failed to enqueue message from ${userId}: ${formatUnknownError(err)}`);
       trackException(err, "enqueue");
     });
   }
@@ -150,22 +162,50 @@ export class WeChatAcpBridge {
   }
 
   private async sendReply(userId: string, contextToken: string, text: string): Promise<void> {
-    const formatted = formatForWeChat(text);
-    const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
+    const parts = splitOutboundReply(text);
+    const mediaRoots = defaultOutboundMediaRoots(this.config.agent.cwd);
     const startedAt = Date.now();
+    let textChars = 0;
+    let mediaCount = 0;
 
     try {
-      for (const segment of segments) {
-        await sendTextMessage(userId, segment, {
-          baseUrl: this.tokenData!.baseUrl,
-          token: this.tokenData!.token,
-          contextToken,
-        });
+      for (const part of parts) {
+        if (part.type === "text") {
+          textChars += await this.sendTextSegments(userId, contextToken, part.text);
+          continue;
+        }
+
+        const media = await resolveOutboundMedia(part.path, { roots: mediaRoots });
+        if (!media.ok) {
+          const fallback = formatForWeChat(part.fallbackText);
+          if (fallback) {
+            textChars += await this.sendTextSegments(userId, contextToken, fallback);
+          }
+          this.log(`Skipped outbound media "${path.basename(part.path)}": ${media.reason}`);
+          continue;
+        }
+
+        try {
+          await sendMediaMessage(userId, { path: media.path, kind: media.kind }, {
+            baseUrl: this.tokenData!.baseUrl,
+            cdnBaseUrl: this.config.wechat.cdnBaseUrl,
+            token: this.tokenData!.token,
+            contextToken,
+          });
+          mediaCount += 1;
+        } catch (err) {
+          const fallback = formatForWeChat(part.fallbackText);
+          if (fallback) {
+            textChars += await this.sendTextSegments(userId, contextToken, fallback);
+          }
+          this.log(`Failed to send outbound media "${path.basename(media.path)}": ${formatUnknownError(err)}`);
+        }
       }
       trackEvent("reply.sent", {
         userIdHash: hashUserId(userId),
-        segments: segments.length,
-        chars: formatted.length,
+        segments: parts.length,
+        chars: textChars,
+        media: mediaCount,
         durationMs: Date.now() - startedAt,
       });
     } catch (err) {
@@ -175,6 +215,20 @@ export class WeChatAcpBridge {
 
     // Cancel typing indicator after reply is sent
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  private async sendTextSegments(userId: string, contextToken: string, text: string): Promise<number> {
+    const formatted = formatForWeChat(text);
+    if (!formatted) return 0;
+    const segments = splitText(formatted, TEXT_CHUNK_LIMIT);
+    for (const segment of segments) {
+      await sendTextMessage(userId, segment, {
+        baseUrl: this.tokenData!.baseUrl,
+        token: this.tokenData!.token,
+        contextToken,
+      });
+    }
+    return formatted.length;
   }
 
   private async cancelTypingIndicator(userId: string, contextToken: string): Promise<void> {
@@ -261,5 +315,60 @@ export class WeChatAcpBridge {
       if (item.type === 5) return "video";
     }
     return "empty";
+  }
+
+  private inboundMessageKey(msg: WeixinMessage, userId: string): string | null {
+    if (msg.message_id != null && Number.isFinite(msg.message_id) && msg.message_id > 0) {
+      return `${userId}:message:${msg.message_id}`;
+    }
+    if (msg.client_id) {
+      return `${userId}:client:${msg.client_id}`;
+    }
+    if (msg.seq != null && Number.isFinite(msg.seq) && msg.seq > 0) {
+      return `${userId}:seq:${msg.seq}`;
+    }
+    for (const item of msg.item_list ?? []) {
+      if (item.msg_id) return `${userId}:item:${item.msg_id}`;
+    }
+
+    const timestamp = msg.create_time_ms ?? msg.update_time_ms;
+    if (timestamp == null || !Number.isFinite(timestamp) || timestamp <= 0) {
+      return null;
+    }
+    return `${userId}:time:${timestamp}:${this.inboundMessageFingerprint(msg)}`;
+  }
+
+  private inboundMessageFingerprint(msg: WeixinMessage): string {
+    return JSON.stringify((msg.item_list ?? []).map((item) => ({
+      type: item.type,
+      text: item.text_item?.text,
+      voiceText: item.voice_item?.text,
+      fileName: item.file_item?.file_name,
+      fileMd5: item.file_item?.md5,
+      imageSize: item.image_item?.mid_size,
+      videoMd5: item.video_item?.video_md5,
+    })));
+  }
+
+  private markInboundMessageSeen(key: string): boolean {
+    const now = Date.now();
+    this.pruneSeenInboundMessages(now);
+    const expiresAt = this.seenInboundMessages.get(key);
+    if (expiresAt && expiresAt > now) return false;
+    this.seenInboundMessages.set(key, now + INBOUND_DEDUPE_TTL_MS);
+    while (this.seenInboundMessages.size > INBOUND_DEDUPE_MAX_KEYS) {
+      const oldest = this.seenInboundMessages.keys().next().value;
+      if (!oldest) break;
+      this.seenInboundMessages.delete(oldest);
+    }
+    return true;
+  }
+
+  private pruneSeenInboundMessages(now: number): void {
+    for (const [key, expiresAt] of this.seenInboundMessages) {
+      if (expiresAt <= now) {
+        this.seenInboundMessages.delete(key);
+      }
+    }
   }
 }
